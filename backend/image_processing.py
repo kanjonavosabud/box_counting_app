@@ -20,6 +20,7 @@ class GrayscaleImage:
 class BoxResult:
     s: int
     count: int
+    total_boxes: int
     logInvS: float
     logN: float
 
@@ -35,6 +36,7 @@ class HighlightBox:
     x: int
     y: int
     size: int
+    box_index: int
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ class AnalysisResult:
     binary: np.ndarray
     results: list[BoxResult]
     regression: RegressionResult | None
+    progressive_regressions: list[RegressionResult | None]
     highlights_by_scale: dict[int, list[HighlightBox]]
 
 
@@ -145,6 +148,7 @@ def count_non_empty_boxes(
                         x=start_x,
                         y=start_y,
                         size=box_size,
+                        box_index=by * boxes_x + bx,
                     )
                 )
 
@@ -179,21 +183,26 @@ def analyze_grayscale(
     min_dim = min(grayscale.width, grayscale.height)
 
     results: list[BoxResult] = []
+    progressive_regressions: list[RegressionResult | None] = []
     highlights_by_scale: dict[int, list[HighlightBox]] = {}
 
     for box_size in box_sizes:
         count, highlights = count_non_empty_boxes(binary, box_size)
         highlights_by_scale[box_size] = highlights
+        total_boxes = math.ceil(grayscale.width / box_size) * math.ceil(
+            grayscale.height / box_size
+        )
 
         inv_scale = min_dim / box_size
-        results.append(
-            BoxResult(
-                s=box_size,
-                count=count,
-                logInvS=math.log(inv_scale),
-                logN=math.log(count or 1),
-            )
+        result = BoxResult(
+            s=box_size,
+            count=count,
+            total_boxes=total_boxes,
+            logInvS=math.log(inv_scale),
+            logN=math.log(count or 1),
         )
+        results.append(result)
+        progressive_regressions.append(compute_regression(results))
 
     regression = compute_regression(results)
 
@@ -205,6 +214,7 @@ def analyze_grayscale(
         binary=binary,
         results=results,
         regression=regression,
+        progressive_regressions=progressive_regressions,
         highlights_by_scale=highlights_by_scale,
     )
 

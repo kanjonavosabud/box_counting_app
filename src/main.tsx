@@ -16,6 +16,7 @@ import './index.css';
 type BoxResult = {
   s: number;
   count: number;
+  totalBoxes: number;
   logInvS: number;
   logN: number;
 };
@@ -25,28 +26,45 @@ type RegressionResult = {
   intercept: number;
 } | null;
 
+type HighlightBox = {
+  x: number;
+  y: number;
+  size: number;
+  boxIndex: number;
+};
+
+type AnalysisResponse = {
+  width: number;
+  height: number;
+  threshold: number;
+  boxSizes: number[];
+  results: BoxResult[];
+  regression: RegressionResult;
+  progressiveRegressions: RegressionResult[];
+  highlightsByScale: Record<string, HighlightBox[]>;
+};
+
 const App: React.FC = () => {
+  const [imageFile, setImageFile] = useState<File | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [threshold, setThreshold] = useState<number>(180);
   const [isRunning, setIsRunning] = useState(false);
   const [speedMode, setSpeedMode] = useState<'fast' | 'slow'>('fast');
+  const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [results, setResults] = useState<BoxResult[]>([]);
   const [regression, setRegression] = useState<RegressionResult>(null);
   const [currentBoxSizeIndex, setCurrentBoxSizeIndex] = useState<number>(0);
-  const [currentHighlightBoxes, setCurrentHighlightBoxes] = useState<
-    { x: number; y: number; size: number }[]
-  >([]);
-
-  const [boxSizes, setBoxSizes] = useState<number[]>([]);
+  const [currentHighlightBoxes, setCurrentHighlightBoxes] = useState<HighlightBox[]>([]);
 
   const displayCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
-  const binaryMatrixRef = useRef<Uint8ClampedArray | null>(null);
-  const imageDimensionsRef = useRef<{ width: number; height: number } | null>(null);
+  const imageElementRef = useRef<HTMLImageElement | null>(null);
+  const analysisRequestIdRef = useRef(0);
 
   const [gridProgress, setGridProgress] = useState<number>(0);
   const [isPrepared, setIsPrepared] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
 
   const cleanupAnimation = () => {
     if (animationFrameRef.current !== null) {
@@ -55,96 +73,33 @@ const App: React.FC = () => {
     }
   };
 
-  const computeRegression = useCallback((points: BoxResult[]): RegressionResult => {
-    if (points.length < 2) return null;
-    const n = points.length;
-    let sumX = 0;
-    let sumY = 0;
-    let sumXY = 0;
-    let sumX2 = 0;
-    for (const p of points) {
-      sumX += p.logInvS;
-      sumY += p.logN;
-      sumXY += p.logInvS * p.logN;
-      sumX2 += p.logInvS * p.logInvS;
-    }
-    const denom = n * sumX2 - sumX * sumX;
-    if (denom === 0) return null;
-    const slope = (n * sumXY - sumX * sumY) / denom;
-    const intercept = (sumY - slope * sumX) / n;
-    return { slope, intercept };
+  const resetSimulation = useCallback(() => {
+    cleanupAnimation();
+    setIsRunning(false);
+    setResults([]);
+    setRegression(null);
+    setCurrentBoxSizeIndex(0);
+    setGridProgress(0);
+    setCurrentHighlightBoxes([]);
   }, []);
 
-  const prepareImage = useCallback(
-    (img: HTMLImageElement) => {
-      const maxWidth = 600;
-      const maxHeight = 400;
-      let { width, height } = img;
-      const scale = Math.min(maxWidth / width, maxHeight / height, 1);
-      width = Math.floor(width * scale);
-      height = Math.floor(height * scale);
+  const drawBaseImage = useCallback(() => {
+    if (!analysis || !displayCanvasRef.current) return null;
 
-      if (!offscreenCanvasRef.current) {
-        offscreenCanvasRef.current = document.createElement('canvas');
-      }
-      const off = offscreenCanvasRef.current;
-      off.width = width;
-      off.height = height;
+    const canvas = displayCanvasRef.current;
+    canvas.width = analysis.width;
+    canvas.height = analysis.height;
 
-      const ctx = off.getContext('2d');
-      if (!ctx) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
 
-      ctx.clearRect(0, 0, width, height);
-      ctx.drawImage(img, 0, 0, width, height);
+    ctx.clearRect(0, 0, analysis.width, analysis.height);
+    if (imageElementRef.current) {
+      ctx.drawImage(imageElementRef.current, 0, 0, analysis.width, analysis.height);
+    }
 
-      const imageData = ctx.getImageData(0, 0, width, height);
-      const data = imageData.data;
-      const binary = new Uint8ClampedArray(width * height);
-
-      for (let i = 0; i < data.length; i += 4) {
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-        const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-        const idx = i / 4;
-        binary[idx] = gray < threshold ? 1 : 0;
-      }
-
-      binaryMatrixRef.current = binary;
-      imageDimensionsRef.current = { width, height };
-
-      if (displayCanvasRef.current) {
-        const dCanvas = displayCanvasRef.current;
-        dCanvas.width = width;
-        dCanvas.height = height;
-        const dctx = dCanvas.getContext('2d');
-        if (dctx) {
-          dctx.clearRect(0, 0, width, height);
-          dctx.drawImage(img, 0, 0, width, height);
-        }
-      }
-
-      const sizes: number[] = [];
-      const minDim = Math.min(width, height);
-      let s = minDim;
-      while (s >= 4) {
-        sizes.push(s);
-        s = Math.floor(s / 1.6);
-      }
-      if (sizes[sizes.length - 1] !== 2 && sizes[sizes.length - 1] > 2) {
-        sizes.push(2);
-      }
-
-      setBoxSizes(sizes);
-      setResults([]);
-      setRegression(null);
-      setCurrentBoxSizeIndex(0);
-      setCurrentHighlightBoxes([]);
-      setGridProgress(0);
-      setIsPrepared(true);
-    },
-    [threshold],
-  );
+    return ctx;
+  }, [analysis]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -154,29 +109,66 @@ const App: React.FC = () => {
       if (prev) URL.revokeObjectURL(prev);
       return url;
     });
-    setIsPrepared(false);
-    const img = new Image();
-    img.onload = () => {
-      prepareImage(img);
-    };
-    img.src = url;
+    setImageFile(file);
+    setAnalysisError(null);
   };
 
   useEffect(() => {
-    if (!imageUrl) return;
-    const img = new Image();
-    img.onload = () => {
-      prepareImage(img);
+    if (!imageFile) return;
+
+    const requestId = analysisRequestIdRef.current + 1;
+    analysisRequestIdRef.current = requestId;
+    const abortController = new AbortController();
+
+    resetSimulation();
+    setIsPrepared(false);
+    setIsAnalyzing(true);
+    setAnalysisError(null);
+    setAnalysis(null);
+
+    const formData = new FormData();
+    formData.append('image', imageFile);
+    formData.append('threshold', String(threshold));
+
+    fetch('/api/analyze', {
+      method: 'POST',
+      body: formData,
+      signal: abortController.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`Backend request failed with status ${response.status}`);
+        }
+        return response.json() as Promise<AnalysisResponse>;
+      })
+      .then((data) => {
+        if (analysisRequestIdRef.current !== requestId) return;
+        setAnalysis(data);
+        setIsPrepared(true);
+      })
+      .catch((error: unknown) => {
+        if (abortController.signal.aborted) return;
+        const message =
+          error instanceof Error ? error.message : 'The Python analysis failed to run.';
+        setAnalysisError(message);
+      })
+      .finally(() => {
+        if (analysisRequestIdRef.current === requestId) {
+          setIsAnalyzing(false);
+        }
+      });
+
+    return () => {
+      abortController.abort();
     };
-    img.src = imageUrl;
-  }, [threshold, imageUrl, prepareImage]);
+  }, [imageFile, resetSimulation, threshold]);
 
   const drawGridOverlay = (
     ctx: CanvasRenderingContext2D,
     width: number,
     height: number,
     boxSize: number,
-    highlightBoxes: { x: number; y: number; size: number }[],
+    highlightBoxes: HighlightBox[],
   ) => {
     ctx.save();
     ctx.strokeStyle = 'rgba(148, 163, 184, 0.6)';
@@ -208,106 +200,91 @@ const App: React.FC = () => {
     ctx.restore();
   };
 
-  const stepSimulation = useCallback(() => {
-    const dims = imageDimensionsRef.current;
-    const binary = binaryMatrixRef.current;
-    if (!dims || !binary || !displayCanvasRef.current) {
-      setIsRunning(false);
-      return;
-    }
-    const { width, height } = dims;
-    const minDim = Math.min(width, height);
-    const canvas = displayCanvasRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+  useEffect(() => {
+    if (!imageUrl || !analysis) return;
 
     const img = new Image();
     img.onload = () => {
-      ctx.clearRect(0, 0, width, height);
-      ctx.drawImage(img, 0, 0, width, height);
-
-      if (currentBoxSizeIndex >= boxSizes.length) {
-        setIsRunning(false);
-        animationFrameRef.current = null;
-        return;
-      }
-
-      const s = boxSizes[currentBoxSizeIndex];
-      const boxesX = Math.ceil(width / s);
-      const boxesY = Math.ceil(height / s);
-      const totalBoxes = boxesX * boxesY;
-
-      let processedBoxes = Math.floor(gridProgress * totalBoxes);
-      const highlight: { x: number; y: number; size: number }[] = [];
-      let nonEmptyCount = 0;
-
-      const speedFactor = speedMode === 'fast' ? 1 : 0.3;
-      const boxesPerFrame = Math.max(
-        1,
-        Math.floor((totalBoxes / 30) * speedFactor),
-      );
-      const targetProcessed = Math.min(
-        processedBoxes + boxesPerFrame,
-        totalBoxes,
-      );
-
-      for (let by = 0; by < boxesY; by++) {
-        for (let bx = 0; bx < boxesX; bx++) {
-          const boxIndex = by * boxesX + bx;
-          if (boxIndex >= targetProcessed) continue;
-
-          let hasForeground = false;
-          const startX = bx * s;
-          const startY = by * s;
-          const endX = Math.min(startX + s, width);
-          const endY = Math.min(startY + s, height);
-
-          for (let y = startY; y < endY && !hasForeground; y++) {
-            for (let x = startX; x < endX; x++) {
-              const idx = y * width + x;
-              if (binary[idx] === 1) {
-                hasForeground = true;
-                break;
-              }
-            }
-          }
-
-          if (hasForeground) {
-            nonEmptyCount++;
-            highlight.push({ x: startX, y: startY, size: s });
-          }
-        }
-      }
-
-      const newProgress = targetProcessed / totalBoxes;
-
-      drawGridOverlay(ctx, width, height, s, highlight);
-
-      setCurrentHighlightBoxes(highlight);
-      setGridProgress(newProgress);
-
-      if (targetProcessed >= totalBoxes - 1) {
-        const invScale = minDim / s;
-        const logInvS = Math.log(invScale);
-        const logN = Math.log(nonEmptyCount || 1);
-        setResults((prev) => {
-          const updated = [...prev, { s, count: nonEmptyCount, logInvS, logN }];
-          setRegression(computeRegression(updated));
-          return updated;
-        });
-        setCurrentBoxSizeIndex((prev) => prev + 1);
-        setGridProgress(0);
-      }
-
-      if (isRunning) {
-        animationFrameRef.current = requestAnimationFrame(stepSimulation);
+      imageElementRef.current = img;
+      const ctx = drawBaseImage();
+      if (ctx && currentBoxSizeIndex < analysis.boxSizes.length) {
+        drawGridOverlay(
+          ctx,
+          analysis.width,
+          analysis.height,
+          analysis.boxSizes[currentBoxSizeIndex],
+          currentHighlightBoxes,
+        );
       }
     };
+    img.src = imageUrl;
 
-    if (imageUrl) {
-      img.src = imageUrl;
+    return () => {
+      imageElementRef.current = null;
+    };
+  }, [
+    analysis,
+    currentBoxSizeIndex,
+    currentHighlightBoxes,
+    drawBaseImage,
+    imageUrl,
+  ]);
+
+  const stepSimulation = useCallback(() => {
+    if (!analysis || !displayCanvasRef.current || !imageElementRef.current) {
+      setIsRunning(false);
+      return;
     }
-  }, [boxSizes, computeRegression, currentBoxSizeIndex, gridProgress, imageUrl, isRunning, speedMode]);
+
+    if (currentBoxSizeIndex >= analysis.boxSizes.length) {
+      setIsRunning(false);
+      animationFrameRef.current = null;
+      return;
+    }
+
+    const currentResult = analysis.results[currentBoxSizeIndex];
+    const s = currentResult.s;
+    const totalBoxes = currentResult.totalBoxes;
+    const scaleHighlights = analysis.highlightsByScale[String(s)] ?? [];
+
+    const processedBoxes = Math.floor(gridProgress * totalBoxes);
+    const speedFactor = speedMode === 'fast' ? 1 : 0.3;
+    const boxesPerFrame = Math.max(1, Math.floor((totalBoxes / 30) * speedFactor));
+    const targetProcessed = Math.min(processedBoxes + boxesPerFrame, totalBoxes);
+
+    const visibleHighlights = scaleHighlights.filter(
+      (box) => box.boxIndex < targetProcessed,
+    );
+
+    const ctx = drawBaseImage();
+    if (!ctx) {
+      setIsRunning(false);
+      return;
+    }
+
+    drawGridOverlay(ctx, analysis.width, analysis.height, s, visibleHighlights);
+    setCurrentHighlightBoxes(visibleHighlights);
+
+    if (targetProcessed >= totalBoxes) {
+      setResults(analysis.results.slice(0, currentBoxSizeIndex + 1));
+      setRegression(analysis.progressiveRegressions[currentBoxSizeIndex] ?? null);
+      setCurrentBoxSizeIndex((prev) => prev + 1);
+      setGridProgress(0);
+    } else {
+      setGridProgress(targetProcessed / totalBoxes);
+    }
+
+    if (isRunning) {
+      animationFrameRef.current = requestAnimationFrame(stepSimulation);
+    }
+  }, [
+    analysis,
+    currentBoxSizeIndex,
+    drawBaseImage,
+    gridProgress,
+    isRunning,
+    speedMode,
+  ]);
 
   useEffect(() => {
     if (isRunning) {
@@ -321,22 +298,35 @@ const App: React.FC = () => {
     };
   }, [isRunning, stepSimulation]);
 
-  const handleToggleRun = () => {
-    if (!imageUrl || !isPrepared || boxSizes.length === 0) return;
-    setIsRunning((prev) => !prev);
-  };
+  useEffect(() => {
+    return () => {
+      if (imageUrl) {
+        URL.revokeObjectURL(imageUrl);
+      }
+    };
+  }, [imageUrl]);
 
-  const resetSimulation = () => {
-    setResults([]);
-    setRegression(null);
-    setCurrentBoxSizeIndex(0);
-    setGridProgress(0);
-    setCurrentHighlightBoxes([]);
+  const handleToggleRun = () => {
+    if (!imageUrl || !isPrepared || !analysis || analysis.boxSizes.length === 0) return;
+
+    if (isRunning) {
+      setIsRunning(false);
+      return;
+    }
+
+    if (currentBoxSizeIndex >= analysis.boxSizes.length) {
+      setResults([]);
+      setRegression(null);
+      setCurrentBoxSizeIndex(0);
+      setGridProgress(0);
+      setCurrentHighlightBoxes([]);
+    }
+
+    setIsRunning(true);
   };
 
   const handleThresholdChange = (value: number) => {
     setThreshold(value);
-    resetSimulation();
   };
 
   const chartData = results
@@ -363,6 +353,8 @@ const App: React.FC = () => {
 
   const currentD =
     regression && !Number.isNaN(regression.slope) ? regression.slope : undefined;
+
+  const boxSizes = analysis?.boxSizes ?? [];
 
   return (
     <div className="min-h-screen bg-white text-slate-900 flex justify-center overflow-y-auto">
@@ -399,7 +391,7 @@ const App: React.FC = () => {
             <button
               type="button"
               onClick={handleToggleRun}
-              disabled={!imageUrl || !isPrepared || boxSizes.length === 0}
+              disabled={!imageUrl || !isPrepared || boxSizes.length === 0 || isAnalyzing}
               className="inline-flex items-center gap-2 rounded-full bg-cyan-500 px-4 py-2 text-sm font-semibold text-white shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {isRunning ? (
@@ -440,6 +432,13 @@ const App: React.FC = () => {
                 Slow
               </button>
             </div>
+
+            {(isAnalyzing || analysisError) && (
+              <span className={`text-xs ${analysisError ? 'text-rose-600' : 'text-slate-500'}`}>
+                {analysisError ?? 'Analyzing image in Python...'}
+              </span>
+            )}
+
           </div>
         </header>
 
