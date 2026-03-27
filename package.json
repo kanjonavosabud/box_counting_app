@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "vite",
-    "dev:backend": "python3 -m uvicorn backend.app:app --reload --port 8000",
+    "setup:backend": "python3 -m venv .venv && ./.venv/bin/python -m pip install --upgrade pip && ./.venv/bin/python -m pip install -r backend/requirements.txt",
+    "dev:backend": "./.venv/bin/python -m uvicorn backend.app:app --reload --port 8000",
     "build": "vite build",
     "preview": "vite preview"
   },
